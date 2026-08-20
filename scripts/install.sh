@@ -1,25 +1,26 @@
 #!/bin/sh
 #
-# install-alpine.sh — Install s-ui on Alpine Linux
+# install.sh — Install s-ui on Alpine Linux or Debian/Ubuntu
 #
-# Downloads binaries from GitHub Releases (no git needed for large files).
+# Auto-detects the OS (Alpine → OpenRC, Debian/Ubuntu → systemd) and the
+# architecture. Downloads binaries from GitHub Releases (no git needed).
 #
 # Usage:
-#   ./install-alpine.sh [OPTIONS]
+#   ./install.sh [OPTIONS]
 #
 # Options:
 #   --repo <user/repo>  GitHub repo (default: samoyed24/alpine-s-ui-light)
 #   --arch <arch>       Force architecture (amd64|arm64). Auto-detected by default.
 #   --install-dir <dir> Installation directory. Default: /usr/local/s-ui
 #   --version <ver>     Specific version to install (default: latest)
-#   --uninstall         Remove s-ui and OpenRC service
+#   --uninstall         Remove s-ui and its service
 #   -h, --help          Show this help
 #
 # Examples:
-#   ./install-alpine.sh
-#   ./install-alpine.sh --arch arm64
-#   ./install-alpine.sh --repo myuser/myrepo --version v1.4.2
-#   ./install-alpine.sh --uninstall
+#   ./install.sh
+#   ./install.sh --arch arm64
+#   ./install.sh --repo myuser/myrepo --version v1.4.2
+#   ./install.sh --uninstall
 
 set -e
 
@@ -39,6 +40,8 @@ INSTALL_DIR="/usr/local/s-ui"
 DATA_DIR="/etc/s-ui"
 LOG_FILE="/var/log/s-ui.log"
 INIT_SCRIPT="/etc/init.d/s-ui"
+SERVICE_FILE="/etc/systemd/system/s-ui.service"
+OS=""
 ARCH=""
 VERSION="latest"
 UNINSTALL=false
@@ -68,15 +71,25 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# ── OS check ──────────────────────────────────────────────────────────────────
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    if [ "$ID" != "alpine" ]; then
-        log_warn "This script is designed for Alpine Linux. Detected: $ID"
+# ── Detect OS ─────────────────────────────────────────────────────────────────
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            alpine)            OS="alpine" ;;
+            debian|ubuntu)     OS="debian" ;;
+            *)
+                log_error "Unsupported OS: $ID"
+                log_error "Supported: alpine, debian, ubuntu"
+                exit 1
+                ;;
+        esac
+    else
+        log_error "Cannot detect OS (/etc/os-release not found)"
+        exit 1
     fi
-else
-    log_warn "Cannot detect OS. Proceeding anyway."
-fi
+    log_info "Detected OS: $OS"
+}
 
 # ── Detect architecture ───────────────────────────────────────────────────────
 detect_arch() {
@@ -103,28 +116,40 @@ detect_arch() {
 
 # ── Check dependencies ────────────────────────────────────────────────────────
 check_deps() {
-    local need_wget=false need_openrc=false
+    case "$OS" in
+        alpine)
+            local need_wget=false need_openrc=false
 
-    if ! command -v wget >/dev/null 2>&1; then
-        need_wget=true
-    fi
-    if ! command -v rc-service >/dev/null 2>&1 || ! command -v rc-update >/dev/null 2>&1; then
-        need_openrc=true
-    fi
+            command -v wget >/dev/null 2>&1 || need_wget=true
+            command -v rc-service >/dev/null 2>&1 || command -v rc-update >/dev/null 2>&1 || need_openrc=true
 
-    if $need_wget || $need_openrc; then
-        local packages=""
-        $need_wget && packages="$packages wget"
-        $need_openrc && packages="$packages openrc"
+            if $need_wget || $need_openrc; then
+                local packages=""
+                $need_wget && packages="$packages wget"
+                $need_openrc && packages="$packages openrc"
 
-        log_info "Installing missing dependencies:$packages"
-        apk add --no-cache $packages
-        if [ $? -ne 0 ]; then
-            log_error "Failed to install dependencies. Run manually: apk add$packages"
-            exit 1
-        fi
-        log_info "Dependencies installed successfully"
-    fi
+                log_info "Installing missing dependencies:$packages"
+                apk add --no-cache $packages
+                if [ $? -ne 0 ]; then
+                    log_error "Failed to install dependencies. Run manually: apk add$packages"
+                    exit 1
+                fi
+                log_info "Dependencies installed successfully"
+            fi
+            ;;
+        debian)
+            if ! command -v wget >/dev/null 2>&1; then
+                log_info "Installing missing dependency: wget"
+                apt-get update -qq
+                apt-get install -y -qq wget
+                if [ $? -ne 0 ]; then
+                    log_error "Failed to install wget. Run manually: apt-get install -y wget"
+                    exit 1
+                fi
+                log_info "Dependencies installed successfully"
+            fi
+            ;;
+    esac
 }
 
 # ── Get version ───────────────────────────────────────────────────────────────
@@ -172,16 +197,23 @@ download_files() {
 do_uninstall() {
     log_info "Uninstalling s-ui..."
 
-    # Stop service
-    if rc-service s-ui status >/dev/null 2>&1; then
-        rc-service s-ui stop 2>/dev/null || true
-    fi
-
-    # Remove from boot
-    rc-update del s-ui default 2>/dev/null || true
-
-    # Remove init script
-    rm -f "$INIT_SCRIPT"
+    case "$OS" in
+        alpine)
+            if rc-service s-ui status >/dev/null 2>&1; then
+                rc-service s-ui stop 2>/dev/null || true
+            fi
+            rc-update del s-ui default 2>/dev/null || true
+            rm -f "$INIT_SCRIPT"
+            ;;
+        debian)
+            if systemctl is-active --quiet s-ui; then
+                systemctl stop s-ui 2>/dev/null || true
+            fi
+            systemctl disable s-ui 2>/dev/null || true
+            rm -f "$SERVICE_FILE"
+            systemctl daemon-reload 2>/dev/null || true
+            ;;
+    esac
 
     # Remove install dir
     rm -rf "$INSTALL_DIR"
@@ -201,7 +233,7 @@ do_uninstall() {
     exit 0
 }
 
-# ── Create OpenRC service ─────────────────────────────────────────────────────
+# ── Install service (OpenRC) ─────────────────────────────────────────────────
 install_openrc_service() {
     log_info "Creating OpenRC service..."
 
@@ -234,21 +266,73 @@ INITEOF
     log_info "OpenRC service created at $INIT_SCRIPT"
 }
 
+# ── Install service (systemd) ────────────────────────────────────────────────
+install_systemd_service() {
+    log_info "Creating systemd service..."
+
+    cat > "$SERVICE_FILE" << 'SERVICEEOF'
+[Unit]
+Description=s-ui Panel (Sing-Box based)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/local/s-ui
+ExecStart=/usr/local/s-ui/sui
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/s-ui.log
+StandardError=append:/var/log/s-ui.log
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+    systemctl daemon-reload
+    log_info "systemd service created at $SERVICE_FILE"
+}
+
+# ── Install service ──────────────────────────────────────────────────────────
+install_service() {
+    case "$OS" in
+        alpine) install_openrc_service ;;
+        debian) install_systemd_service ;;
+    esac
+}
+
 # ── Enable and start ─────────────────────────────────────────────────────────
 enable_and_start() {
-    # Add to default runlevel (boot auto-start)
-    rc-update add s-ui default 2>/dev/null || {
-        log_warn "s-ui already in default runlevel or rc-update failed"
-    }
+    case "$OS" in
+        alpine)
+            rc-update add s-ui default 2>/dev/null || {
+                log_warn "s-ui already in default runlevel or rc-update failed"
+            }
+            log_info "Starting s-ui service..."
+            rc-service s-ui start
+            sleep 2
+            if rc-service s-ui status; then
+                SERVICE_OK=true
+            else
+                SERVICE_OK=false
+            fi
+            ;;
+        debian)
+            systemctl enable s-ui 2>/dev/null || {
+                log_warn "s-ui already enabled or systemctl enable failed"
+            }
+            log_info "Starting s-ui service..."
+            systemctl start s-ui
+            sleep 2
+            if systemctl is-active --quiet s-ui; then
+                SERVICE_OK=true
+            else
+                SERVICE_OK=false
+            fi
+            ;;
+    esac
 
-    # Start the service
-    log_info "Starting s-ui service..."
-    rc-service s-ui start
-
-    sleep 2
-
-    # Check status
-    if rc-service s-ui status; then
+    if $SERVICE_OK; then
         log_info "s-ui is running!"
         LOCAL_VER=$(cat "$INSTALL_DIR/version.txt" 2>/dev/null || echo "unknown")
         log_info "Version: $LOCAL_VER"
@@ -262,22 +346,29 @@ enable_and_start() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
+    detect_os
+
     if $UNINSTALL; then
         do_uninstall
     fi
 
-    log_info "=== s-ui Alpine Installer ==="
+    log_info "=== s-ui Installer ($OS) ==="
 
     detect_arch
     check_deps
     get_version
     download_files
-    install_openrc_service
+    install_service
     enable_and_start
 
     log_info "=== Installation complete ==="
-    log_info "Service: rc-service s-ui {start|stop|restart|status}"
-    log_info "Manage:  rc-update {add|del} s-ui default"
+    if [ "$OS" = "alpine" ]; then
+        log_info "Service: rc-service s-ui {start|stop|restart|status}"
+        log_info "Manage:  rc-update {add|del} s-ui default"
+    else
+        log_info "Service: systemctl {start|stop|restart|status} s-ui"
+        log_info "Manage:  systemctl {enable|disable} s-ui"
+    fi
     log_info "Logs:    tail -f $LOG_FILE"
 }
 

@@ -1,18 +1,23 @@
 # alpine-s-ui-light
 
-适用于小内存 Alpine Linux / Debian 的 [s-ui](https://github.com/alireza0/s-ui) 面板部署方案。
+适用于小内存 Alpine Linux / Debian / Ubuntu 的 [s-ui](https://github.com/alireza0/s-ui) 面板部署方案。
 
-GitHub Action 每日自动同步 s-ui 最新版本，Alpine / Debian 安装脚本一键部署。
+GitHub Action 每日自动同步 s-ui 最新版本，单一安装脚本自动检测系统与架构，一键部署。
 
-## Alpine Linux
-
-### 快速安装
+## 快速安装
 
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/samoyed24/alpine-s-ui-light/main/scripts/install-alpine.sh && chmod +x install.sh && ./install.sh
+wget -O install.sh https://raw.githubusercontent.com/samoyed24/alpine-s-ui-light/main/scripts/install.sh && chmod +x install.sh && ./install.sh
 ```
 
-### 服务管理
+脚本会自动检测操作系统与架构：
+
+- **Alpine Linux** → OpenRC 服务（`rc-service` / `rc-update`）
+- **Debian / Ubuntu** → systemd 服务（`systemctl`）
+
+## 服务管理
+
+### Alpine Linux
 
 ```bash
 rc-service s-ui start               # 启动
@@ -22,17 +27,7 @@ rc-service s-ui status              # 状态
 tail -f /var/log/s-ui.log           # 查看日志
 ```
 
-服务使用 OpenRC 管理，已配置开机自启和崩溃自动重启。
-
-## Debian / Ubuntu
-
-### 快速安装
-
-```bash
-wget -O install.sh https://raw.githubusercontent.com/samoyed24/alpine-s-ui-light/main/scripts/install-debian.sh && chmod +x install.sh && ./install.sh
-```
-
-### 服务管理
+### Debian / Ubuntu
 
 ```bash
 systemctl start s-ui                # 启动
@@ -42,9 +37,9 @@ systemctl status s-ui               # 状态
 tail -f /var/log/s-ui.log           # 查看日志
 ```
 
-服务使用 systemd 管理，已配置开机自启和崩溃自动重启。
+服务已配置开机自启和崩溃自动重启。
 
-## 选项（两个脚本通用）
+## 选项
 
 ```bash
 ./install.sh --arch arm64           # 指定架构（默认自动检测）
