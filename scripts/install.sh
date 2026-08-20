@@ -74,7 +74,7 @@ fi
 # ── Detect OS ─────────────────────────────────────────────────────────────────
 detect_os() {
     if [ -f /etc/os-release ]; then
-        . /etc/os-release
+        ID=$( . /etc/os-release; echo "$ID" )
         case "$ID" in
             alpine)            OS="alpine" ;;
             debian|ubuntu)     OS="debian" ;;
