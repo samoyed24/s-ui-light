@@ -120,6 +120,23 @@ done
 # Certificates sit next to the binary so --install-dir moves them together.
 CERT_DIR="$INSTALL_DIR/cert"
 
+# The service files interpolate these paths, so a value that could break out of
+# a systemd "WorkingDirectory=" line or an OpenRC "directory=" assignment would
+# produce a unit that cannot run -- or worse, one that runs something else.
+case "$INSTALL_DIR" in
+    *[\ \"\'\`\$\*]*)
+        log_error "--install-dir must not contain spaces, quotes, or shell metacharacters"
+        exit 1
+        ;;
+esac
+case "$INSTALL_DIR" in
+    /*) ;;
+    *)
+        log_error "--install-dir must be an absolute path"
+        exit 1
+        ;;
+esac
+
 # ── Root check ────────────────────────────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
     log_error "This script must be run as root"
@@ -247,9 +264,13 @@ download_files() {
     mkdir -p "$INSTALL_DIR"
     mkdir -p "$DATA_DIR"
 
-    # Download main binary (with arch suffix)
+    # Download main binary (with arch suffix).
+    # No --show-progress: Alpine's wget is the busybox applet, whose long-option
+    # table has no such flag. busybox getopt32 calls bb_show_usage() and exits
+    # non-zero on an unknown long option, so the download would fail on every
+    # Alpine host. It also contradicts -q, which is already passed.
     log_info "Downloading sui-$ARCH..."
-    wget -q --show-progress -O "$INSTALL_DIR/sui" "$base_url/sui-$ARCH" || {
+    wget -q -O "$INSTALL_DIR/sui" "$base_url/sui-$ARCH" || {
         log_error "Failed to download sui-$ARCH. Check if version $VERSION exists"
         exit 1
     }
@@ -296,12 +317,21 @@ do_uninstall() {
     # describe what is actually at stake.
     _keep_data=false
     if [ -d "$INSTALL_DIR/db" ]; then
-        printf "Keep the panel database (accounts, nodes, settings) in %s/db? [Y/n]: " "$INSTALL_DIR"
-        read -r ans || true
-        case "$ans" in
-            n|N|no|NO) _keep_data=false ;;
-            *)         _keep_data=true ;;
-        esac
+        if [ -t 0 ] && [ -z "$ASSUME" ]; then
+            printf "Keep the panel database (accounts, nodes, settings) in %s/db? [Y/n]: " "$INSTALL_DIR"
+            read -r ans || true
+            case "$ans" in
+                n|N|no|NO) _keep_data=false ;;
+                *)         _keep_data=true ;;
+            esac
+        else
+            # No terminal (curl | sh, cron), or --yes/--no-prompt. Reading here
+            # would consume the script's own source text out of the shell's
+            # stdin buffer and corrupt the rest of the run, so take the default
+            # that cannot lose data. --no-prompt does not mean "delete my
+            # accounts": an unattended uninstall should still be recoverable.
+            _keep_data=true
+        fi
     fi
 
     if $_keep_data; then
@@ -328,18 +358,21 @@ do_uninstall() {
 install_openrc_service() {
     log_info "Creating OpenRC service..."
 
-    cat > "$INIT_SCRIPT" << 'INITEOF'
+    # Unquoted heredoc so $INSTALL_DIR and $LOG_FILE are substituted -- a
+    # hardcoded /usr/local/s-ui broke --install-dir, leaving a service that
+    # pointed at a directory the binaries were never written to.
+    cat > "$INIT_SCRIPT" << INITEOF
 #!/sbin/openrc-run
 
 supervisor=supervise-daemon
 
 name="s-ui"
 description="s-ui Panel (Sing-Box based)"
-command="/usr/local/s-ui/sui"
-directory="/usr/local/s-ui"
+command="$INSTALL_DIR/sui"
+directory="$INSTALL_DIR"
 
-output_log="/var/log/s-ui.log"
-error_log="/var/log/s-ui.log"
+output_log="$LOG_FILE"
+error_log="$LOG_FILE"
 
 depend() {
     need net
@@ -347,8 +380,8 @@ depend() {
 }
 
 start_pre() {
-    if [ ! -d /etc/s-ui ]; then
-        mkdir -p /etc/s-ui
+    if [ ! -d "$INSTALL_DIR" ]; then
+        mkdir -p "$INSTALL_DIR"
     fi
 }
 INITEOF
@@ -361,7 +394,11 @@ INITEOF
 install_systemd_service() {
     log_info "Creating systemd service..."
 
-    cat > "$SERVICE_FILE" << 'SERVICEEOF'
+    # Unquoted heredoc so $INSTALL_DIR and $LOG_FILE are substituted, so
+    # --install-dir works. LimitNOFILE matches upstream's unit: a proxy holds
+    # two descriptors per connection, and the default 1024 is reached by a few
+    # hundred clients, after which sockets fail to open with no clear cause.
+    cat > "$SERVICE_FILE" << SERVICEEOF
 [Unit]
 Description=s-ui Panel (Sing-Box based)
 After=network-online.target
@@ -369,12 +406,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/usr/local/s-ui
-ExecStart=/usr/local/s-ui/sui
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/sui
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/var/log/s-ui.log
-StandardError=append:/var/log/s-ui.log
+LimitNOFILE=1048576
+StandardOutput=append:$LOG_FILE
+StandardError=append:$LOG_FILE
 
 [Install]
 WantedBy=multi-user.target
@@ -499,10 +537,16 @@ set_admin_password() {
 # and every TLS-bound inbound fails with "x509: invalid ECDSA parameters".
 # Named-curve output is byte-identical in intent on OpenSSL 3 (Debian/Ubuntu).
 generate_cert() {
-    mkdir -p "$CERT_DIR"
+    mkdir -p "$CERT_DIR" || return 1
     chmod 700 "$CERT_DIR"
 
     log_info "Generating a self-signed certificate in $CERT_DIR ..."
+    # Both files are removed up front. A pair left over from an earlier run
+    # would otherwise satisfy the "does the crt exist" check below while its
+    # key is missing or does not match, and the panel accepts that save and
+    # then fails to load the certificate.
+    rm -f "$CERT_DIR/self.key" "$CERT_DIR/self.crt"
+
     if ! openssl ecparam -name prime256v1 -genkey -noout -param_enc named_curve \
             -out "$CERT_DIR/self.key" 2>/dev/null; then
         log_error "Failed to generate the private key"
@@ -513,6 +557,14 @@ generate_cert() {
             -out "$CERT_DIR/self.crt" \
             -subj "/CN=myserver" 2>/dev/null; then
         log_error "Failed to generate the certificate"
+        rm -f "$CERT_DIR/self.key" "$CERT_DIR/self.crt"
+        return 1
+    fi
+
+    # Verified as a pair, not file-by-file: openssl will happily write a cert
+    # from a key, and the panel needs both to be present and consistent.
+    if ! openssl x509 -in "$CERT_DIR/self.crt" -noout -pubkey >/dev/null 2>&1; then
+        log_error "The generated certificate is not readable"
         rm -f "$CERT_DIR/self.key" "$CERT_DIR/self.crt"
         return 1
     fi
@@ -550,6 +602,13 @@ panel_request() {
 # panel_login waits for the panel to answer at all -- TLS finishes coming up a
 # moment after the service reports started. The session is written to
 # COOKIE_JAR, so a later step can reuse it instead of logging in again.
+#
+# The retry only covers the panel not being ready yet. An *answered* rejection
+# is returned immediately: the panel counts failed logins per source address
+# and locks the address out for 10 minutes after 10 of them, so retrying a
+# wrong password 20 times would lock out 127.0.0.1 and make every later call in
+# this run fail too. A rejected login means the credentials need looking at,
+# not that the panel is still starting.
 panel_login() {
     _i=0
     while [ "$_i" -lt 20 ]; do
@@ -558,16 +617,16 @@ panel_login() {
         _out=$(panel_request POST "login" -d "user=$ADMIN_USER" --data-urlencode "pass=$ADMIN_PASS" || true)
         case "$_out" in
             *'"success":true'*) return 0 ;;
+            # Any JSON at all means the panel answered, so retrying cannot help.
+            *'"success":false'*)
+                log_error "The panel rejected the login: $(echo "$_out" | head -c 160)"
+                return 1
+                ;;
         esac
         _i=$(( _i + 1 ))
         sleep 1
     done
-    # Distinguish "never answered" from "answered with a rejected login": a
-    # wrong password means the credentials, not the connection, need a look.
-    case "$_out" in
-        '') log_error "The panel did not answer on $API_BASE" ;;
-        *)  log_error "The panel rejected the login: $(echo "$_out" | head -c 120)" ;;
-    esac
+    log_error "The panel did not answer on $API_BASE"
     return 1
 }
 
@@ -610,11 +669,33 @@ enable_panel_tls() {
             ;;
     esac
 
-    PANEL_TLS=true
+    # The setting is committed before the restart, so the panel is on HTTPS
+    # from here on whether or not the switch below succeeds. PANEL_TLS is
+    # therefore set from what the panel actually serves, not from the intent --
+    # a failed switch must not leave the summary advertising http:// for a
+    # panel that now refuses it.
+    _http_base="http://127.0.0.1:$PANEL_PORT${PANEL_PATH}api/"
     API_BASE="https://127.0.0.1:$PANEL_PORT${PANEL_PATH}api/"
     service_restart
     sleep 3
-    return 0
+
+    _i=0
+    while [ "$_i" -lt 10 ]; do
+        _out=$(panel_request GET "status" || true)
+        case "$_out" in
+            # Any JSON at all means the TLS listener accepted the request.
+            *'"success"'*) PANEL_TLS=true; return 0 ;;
+        esac
+        _i=$(( _i + 1 ))
+        sleep 1
+    done
+
+    # Not answering over HTTPS. Fall back so the remaining steps can still run,
+    # and say so plainly rather than reporting a switch that did not take.
+    log_warn "The panel is not answering over HTTPS; falling back to HTTP"
+    API_BASE="$_http_base"
+    PANEL_TLS=false
+    return 1
 }
 
 # ── Deploy a Hysteria2 inbound ───────────────────────────────────────────────
@@ -624,6 +705,17 @@ deploy_hysteria2() {
     # hardcoded so adding a name to SNI_POOL does not skew the odds.
     _sni_n=$(for _s in $SNI_POOL; do printf '%s\n' "$_s"; done | wc -l | tr -d ' ')
     _sni=$(for _s in $SNI_POOL; do printf '%s\n' "$_s"; done | awk -v n="$_RAND" -v c="$_sni_n" 'NR==(n%c)+1')
+    # A draw that yields nothing (empty pool, or awk comparing against an empty
+    # seed and matching no record) exits 0 and prints an empty string. That
+    # would post a TLS record with "server_name":"" and still report success, so
+    # fall back to the first name rather than deploy a node with no SNI.
+    if [ -z "$_sni" ]; then
+        _sni=$(for _s in $SNI_POOL; do printf '%s\n' "$_s"; done | head -1)
+    fi
+    if [ -z "$_sni" ]; then
+        log_error "No SNI available to use (SNI_POOL is empty)"
+        return 1
+    fi
 
     log_info "Deploying a Hysteria2 node..."
     log_info "  Port: $_port  SNI: $_sni"
@@ -641,11 +733,19 @@ deploy_hysteria2() {
             ;;
     esac
 
-    # Anchored on the "tls" array: the response also carries clients/inbounds
-    # keys, and a bare grep for the first "id" would pick up one of those.
-    _tls_id=$(echo "$_out" | sed 's/.*"tls":\[//' | sed 's/.*"id":\([0-9]\{1,\}\).*/\1/')
-    # Checked for digits, not just non-empty: an empty tls array leaves the
-    # rest of the response behind the marker, which is non-empty but not an id.
+    # The id of the record just created, taken from the first "id" *inside* the
+    # response's "tls" array. Truncating the line at the marker first matters:
+    # a greedy sed over the whole line returns the id belonging to whichever
+    # array happens to sort last, so a response ordered with "tls" before
+    # clients/inbounds yields the wrong row's id and binds the inbound to
+    # another TLS config, silently.
+    _tls_id=$(echo "$_out" | awk '{
+        i = index($0, "\"tls\":[")
+        if (i == 0) { exit }
+        rest = substr($0, i + 7)
+        if (match(rest, /"id"[ ]*:[ ]*[0-9]+/)) print substr(rest, RSTART, RLENGTH)
+    }' | sed 's/[^0-9]//g')
+
     case "$_tls_id" in
         ''|*[!0-9]*)
             log_error "Could not determine the new TLS config id"
@@ -782,7 +882,7 @@ main() {
     if ask "Serve the s-ui panel over HTTPS with a self-signed certificate?"; then
         if generate_cert; then
             if panel_login; then
-                enable_panel_tls || log_warn "Panel left on HTTP"
+                enable_panel_tls || log_warn "The panel did not come up on HTTPS"
                 # The cookie was issued over HTTP; HTTPS logins are re-issued
                 # per request by the panel, so reuse it instead of logging in
                 # again over a certificate curl would have to be told to trust.
