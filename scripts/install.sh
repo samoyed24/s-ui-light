@@ -15,7 +15,7 @@
 #   ./install.sh [OPTIONS]
 #
 # Options:
-#   --repo <user/repo>  GitHub repo (default: samoyed24/alpine-s-ui-light)
+#   --repo <user/repo>  GitHub repo (default: samoyed24/s-ui-light)
 #   --arch <arch>       Force architecture (amd64|arm64). Auto-detected by default.
 #   --install-dir <dir> Installation directory. Default: /usr/local/s-ui
 #   --version <ver>     Specific version to install (default: latest)
@@ -67,7 +67,7 @@ ask() {
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-REPO="samoyed24/alpine-s-ui-light"
+REPO="samoyed24/s-ui-light"
 INSTALL_DIR="/usr/local/s-ui"
 DATA_DIR="/etc/s-ui"
 LOG_FILE="/var/log/s-ui.log"
@@ -245,9 +245,25 @@ check_deps() {
 # ── Get version ───────────────────────────────────────────────────────────────
 get_version() {
     if [ "$VERSION" = "latest" ]; then
-        VERSION=$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "//;s/".*//')
+        _body=$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+
+        # A renamed or transferred repository answers this endpoint with 301 and
+        # a "Moved Permanently" body naming a numeric id, not with releases.
+        # wget does not follow it, so the tag comes back empty. Follow the
+        # redirect explicitly: opaque, but far better than failing the install
+        # with "Failed to fetch latest version" on a repo that still exists.
+        if [ -z "$_body" ] || ! echo "$_body" | grep -q '"tag_name"'; then
+            _moved=$(echo "$_body" | sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' | head -1)
+            if [ -n "$_moved" ]; then
+                log_warn "GitHub reports this repository has moved; following the redirect"
+                _body=$(wget -qO- "$_moved" 2>/dev/null || true)
+            fi
+        fi
+
+        VERSION=$(echo "$_body" | grep '"tag_name"' | head -1 | sed 's/.*: "//;s/".*//')
         if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            log_error "Failed to fetch latest version from GitHub"
+            log_error "Failed to fetch the latest version from GitHub ($REPO)"
+            log_error "Check the repo name with --repo <user/repo>, or pass --version <ver>"
             exit 1
         fi
     fi
