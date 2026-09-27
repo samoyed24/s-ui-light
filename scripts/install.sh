@@ -22,6 +22,7 @@
 #   --uninstall         Remove s-ui and its service
 #   --no-prompt         Skip every interactive question (answer "no" to each)
 #   --yes               Skip every interactive question (answer "yes" to each)
+#   --no-stats          Do not report this run to the public install counter
 #   -h, --help          Show this help
 #
 # Examples:
@@ -84,6 +85,7 @@ ADMIN_PASS=""
 CERT_CRT=""
 CERT_KEY=""
 PANEL_TLS=false
+NO_STATS=false
 
 # Ports and names for the generated certificate. The SNI is a decoy: the
 # certificate is self-signed, so its name is only there to look unremarkable
@@ -101,6 +103,7 @@ while [ $# -gt 0 ]; do
         --uninstall)   UNINSTALL=true; shift ;;
         --yes)         ASSUME="yes"; shift ;;
         --no-prompt)   ASSUME="no"; shift ;;
+        --no-stats)    NO_STATS=true; shift ;;
         -h|--help)
             # Every leading comment line, minus the shebang, up to the first
             # real statement. Stopping at a blank line instead ended the range
@@ -854,6 +857,46 @@ show_summary() {
     printf "${GREEN}==========================================================${NC}\n"
 }
 
+# ── Run counter ───────────────────────────────────────────────────────────────
+# Reports this run to a public counter and prints how many times the script has
+# been run in total. The script is delivered as a single file over wget|sh, so
+# it keeps no state of its own and a local tally would only ever describe the
+# one machine it sits on; a shared counter is the only way "total runs" means
+# anything.
+#
+# Abacus is used because it is the one counter that needs no signup: an API key
+# baked into a public script is not a secret, so keyed services are out.
+# The counter name carries the repo, so forks count separately.
+#
+# Reporting is best-effort in both directions. A failed request must never
+# abort an install that is otherwise fine, and a failure to report must not be
+# confused with a total of zero -- hence the "unknown" wording.
+report_run() {
+    if $NO_STATS; then
+        log_info "Run counter: skipped (--no-stats)"
+        return 0
+    fi
+
+    # curl, not wget: the panel API calls already require it, and it is the
+    # dependency check_deps guarantees. Give up quickly -- the install is
+    # already finished and nobody should wait on a tally.
+    _repo_slug=$(echo "$REPO" | tr '/.' '__')
+    _url="https://abacus.jasoncameron.dev/hit/s-ui-light/$_repo_slug"
+    _resp=$(curl -fsS --max-time 5 "$_url" 2>/dev/null || true)
+
+    # Response is {"value": 42}. Parse it without depending on a JSON tool:
+    # busybox has no jq, and this is a single flat field.
+    _count=$(echo "$_resp" | sed -n 's/.*"value"[: ]*\([0-9][0-9]*\).*/\1/p' | head -1)
+
+    if [ -n "$_count" ]; then
+        log_info "Run counter: this script has been run $_count time(s) in total"
+    else
+        # Offline, rate-limited (30 requests per 10s per IP), or the service is
+        # down. Say so plainly rather than printing a number that looks real.
+        log_warn "Run counter: unavailable (could not reach the counter service)"
+    fi
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
     detect_os
@@ -944,6 +987,8 @@ main() {
         log_info "Manage:  systemctl {enable|disable} s-ui"
     fi
     log_info "Logs:    tail -f $LOG_FILE"
+
+    report_run
 }
 
 main

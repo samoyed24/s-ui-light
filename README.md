@@ -77,9 +77,33 @@ tail -f /var/log/s-ui.log           # 查看日志
 ./install.sh --uninstall            # 卸载
 ./install.sh --no-prompt            # 全部交互问题都答 no（无人值守）
 ./install.sh --yes                  # 全部交互问题都答 yes
+./install.sh --no-stats             # 不上报本次运行，不打印总次数
 ```
 
 `--no-prompt` 适合脚本化部署：跳过 HTTPS 与 Hysteria2，只装服务并重置密码。
 没有终端时（如 `curl | sh`、cron）交互问题同样一律按 no 处理，不会卡住等待输入。
 
 密码重置始终执行 —— 装完却保留 `admin/admin` 默认密码，是最容易被扫到的风险。
+
+## 运行次数统计
+
+脚本安装结束后会打印这个脚本累计被运行了多少次，例如：
+
+```
+[INF] Run counter: this script has been run 137 time(s) in total
+```
+
+脚本是 `wget | sh` 分发的单文件，自身不留任何状态，所以「总运行次数」只能来自
+一个共享计数器。实现方式：
+
+- 每次运行向 [Abacus](https://jasoncameron.dev/abacus/) 发一次
+  `GET /hit/s-ui-light/<仓库名>`，该接口**无需注册、无需 API key**（要注册或要 key
+  的服务都不适用 —— 写进公开脚本的 key 不是密钥），返回 `{"value": N}` 即为总次数。
+- 上报内容是**计数 +1**，不发送任何机器信息、版本号、IP 之外的数据。
+  服务端能看到你的公网 IP，这是任何联网请求都不可避免的。
+- 计数器名称带仓库名，所以 fork 出去的仓库各自独立计数。
+- 整个上报是**尽力而为**的：超时 5 秒，失败只打一条 `[WRN]`，不会中断安装，
+  也不会把「上报失败」显示成 0 次。
+- 不想上报就加 `--no-stats`，或直接不跑这一步。
+
+GitHub Release 的下载量不是替代方案 —— 它只反映有多少人下载过，不是运行次数。
