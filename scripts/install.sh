@@ -92,6 +92,7 @@ NO_STATS=false
 # to a passive observer, and clients skip verification anyway.
 SNI_POOL="www.bing.com www.cloudflare.com www.apple.com www.microsoft.com www.amazon.com"
 HY2_TAG_PREFIX="hysteria2"
+VLESS_TAG_PREFIX="vless-reality"
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -717,24 +718,36 @@ enable_panel_tls() {
     return 1
 }
 
-# ── Deploy a Hysteria2 inbound ───────────────────────────────────────────────
-deploy_hysteria2() {
-    _port=$(random_port)
-    # Pick one decoy hostname at random from the pool. Counted rather than
-    # hardcoded so adding a name to SNI_POOL does not skew the odds.
-    _sni_n=$(for _s in $SNI_POOL; do printf '%s\n' "$_s"; done | wc -l | tr -d ' ')
-    _sni=$(for _s in $SNI_POOL; do printf '%s\n' "$_s"; done | awk -v n="$_RAND" -v c="$_sni_n" 'NR==(n%c)+1')
+# ── Pick a random decoy SNI ──────────────────────────────────────────────────
+# Shared by the Hysteria2 and VLESS+Reality deployments. Returns the chosen
+# hostname through the global SNI.
+pick_sni() {
+    # Counted rather than hardcoded so adding a name to SNI_POOL does not skew
+    # the odds. The same awk draw that reads the seed at call time sees exactly
+    # one SNI value per line.
+    _n=$(for _s in $SNI_POOL; do printf '%s\n' "$_s"; done | wc -l | tr -d ' ')
+    SNI=$(for _s in $SNI_POOL; do printf '%s\n' "$_s"; done | awk -v n="$_RAND" -v c="$_n" 'NR==(n%c)+1')
     # A draw that yields nothing (empty pool, or awk comparing against an empty
     # seed and matching no record) exits 0 and prints an empty string. That
     # would post a TLS record with "server_name":"" and still report success, so
     # fall back to the first name rather than deploy a node with no SNI.
-    if [ -z "$_sni" ]; then
-        _sni=$(for _s in $SNI_POOL; do printf '%s\n' "$_s"; done | head -1)
+    if [ -z "$SNI" ]; then
+        SNI=$(for _s in $SNI_POOL; do printf '%s\n' "$_s"; done | head -1)
     fi
-    if [ -z "$_sni" ]; then
+    if [ -z "$SNI" ]; then
         log_error "No SNI available to use (SNI_POOL is empty)"
         return 1
     fi
+    return 0
+}
+
+# ── Deploy a Hysteria2 inbound ───────────────────────────────────────────────
+deploy_hysteria2() {
+    _port=$(random_port)
+    if ! pick_sni; then
+        return 1
+    fi
+    _sni="$SNI"
 
     log_info "Deploying a Hysteria2 node..."
     log_info "  Port: $_port  SNI: $_sni"
@@ -791,6 +804,129 @@ deploy_hysteria2() {
     HY2_TAG="$_tag"
     HY2_OK=true
     log_info "Hysteria2 node created: $_tag"
+    return 0
+}
+
+# ── Generate a Reality keypair ───────────────────────────────────────────────
+# Asked of the panel, not computed locally: the panel's api/keypairs endpoint
+# (k=reality) uses the same golang.org/x/crypto wg-style X25519 generator s-ui
+# itself uses, and reproducing that curve in shell would mean either shipping a
+# second binary or trusting a hand-rolled Base64url encoder.
+# Reads PRIVATE_KEY and PUBLIC_KEY.
+generate_reality_keypair() {
+    # curl -k: on a panel running the self-signed HTTPS certificate (--yes).
+    _out=$(panel_request GET "keypairs?k=reality")
+    case "$_out" in
+        *'"success":true'*) ;;
+        *)
+            log_error "Failed to generate the Reality keypair: $(echo "$_out" | head -c 200)"
+            return 1
+            ;;
+    esac
+
+    # Response: {"success":true,"msg":"","obj":["PrivateKey: ...","PublicKey: ..."]}.
+    # The keys are X25519 in Base64url without padding. sed is limited to the
+    # two known line prefixes rather than "first string in obj", so a change in
+    # the response's other fields cannot echo its way into a private key.
+    PRIVATE_KEY=$(echo "$_out" | sed -n 's/.*"PrivateKey: \([^"]*\)".*/\1/p')
+    PUBLIC_KEY=$(echo "$_out" | sed -n 's/.*"PublicKey: \([^"]*\)".*/\1/p')
+
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+        log_error "Could not read the Reality keypair from the panel response"
+        return 1
+    fi
+    return 0
+}
+
+# ── Generate a random Reality short_id ───────────────────────────────────────
+# One hex byte is enough and matches what the panel's own randomShortId()
+# produces most often (one random octet, zero-padded). Read from /dev/urandom,
+# guarded like every other od call under set -e.
+random_short_id() {
+    _b=$(od -An -N1 -tu1 < /dev/urandom 2>/dev/null | tr -d ' ' || true)
+    case "$_b" in
+        ''|*[!0-9]*) _b=0 ;;
+    esac
+    printf '%02x' "$_b"
+}
+
+# ── Deploy a VLESS + Reality inbound ────────────────────────────────────────
+# Reality needs no certificate at all: the server borrows the handshake of
+# whatever site the SNI names, so there is nothing self-signed to pin or trust.
+# What the client needs off-band is the server's public key (pbk) and a short
+# id (sid); s-ui carries both in the TLS record it writes the subscription
+# link from, so the link picks them up automatically.
+deploy_vless_reality() {
+    _port=$(random_port)
+    if ! pick_sni; then
+        return 1
+    fi
+    _sni="$SNI"
+    if ! generate_reality_keypair; then
+        return 1
+    fi
+    _sid=$(random_short_id)
+
+    log_info "Deploying a VLESS + Reality node..."
+    log_info "  Port: $_port  SNI: $_sni"
+
+    # 1. TLS config. Server side: reality enabled, with a handshake target --
+    #    the site the forged handshakes are proxied to, which must accept
+    #    TLS 1.3 with h2, i.e. anything the SNI pool names safely. Client side:
+    #    the matching public key, one short id, and the uTLS fingerprint that
+    #    makes the client's handshake indistinguishable from Chrome's.
+    _tls="{\"id\":0,\"name\":\"vless-reality-tls\",\"server\":{\"enabled\":true,\"server_name\":\"$_sni\",\"reality\":{\"enabled\":true,\"handshake\":{\"server\":\"$_sni\",\"server_port\":443},\"private_key\":\"$PRIVATE_KEY\",\"short_id\":[\"$_sid\"]}},\"client\":{\"reality\":{\"enabled\":true,\"public_key\":\"$PUBLIC_KEY\",\"short_id\":\"$_sid\"},\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}}}"
+    _out=$(panel_save tls new "$_tls")
+    case "$_out" in
+        *'"success":true'*) ;;
+        *)
+            log_error "Failed to create the Reality TLS config: $(echo "$_out" | head -c 200)"
+            return 1
+            ;;
+    esac
+
+    # The id of the record just created, taken from the first "id" *inside* the
+    # response's "tls" array. Same pattern as the hy2 deployment: a greedy sed
+    # would bind the inbound to whichever array happens to sort last.
+    _tls_id=$(echo "$_out" | awk '{
+        i = index($0, "\"tls\":[")
+        if (i == 0) { exit }
+        rest = substr($0, i + 7)
+        if (match(rest, /"id"[ ]*:[ ]*[0-9]+/)) print substr(rest, RSTART, RLENGTH)
+    }' | sed 's/[^0-9]//g')
+
+    case "$_tls_id" in
+        ''|*[!0-9]*)
+            log_error "Could not determine the new Reality TLS config id"
+            return 1
+            ;;
+    esac
+    log_info "  Reality TLS config id: $_tls_id"
+
+    # 2. The inbound itself. TCP, no transport -- which is also what lets the
+    #    users carry the xtls-rprx-vision flow that Reality is normally paired
+    #    with, and what genLink checks for when it writes the "flow" parameter.
+    #    The panel fills out_json (the client-side config) from this record
+    #    plus the TLS config above; no users are attached, same as the hy2
+    #    path.
+    _tag="$VLESS_TAG_PREFIX-$_port"
+    _inb="{\"id\":0,\"type\":\"vless\",\"tag\":\"$_tag\",\"tls_id\":$_tls_id,\"listen\":\"::\",\"listen_port\":$_port,\"addrs\":[],\"out_json\":{}}"
+    _out=$(panel_save inbounds new "$_inb")
+    case "$_out" in
+        *'"success":true'*) ;;
+        *)
+            log_error "Failed to create the VLESS inbound: $(echo "$_out" | head -c 200)"
+            return 1
+            ;;
+    esac
+
+    VLESS_PORT="$_port"
+    VLESS_SNI="$_sni"
+    VLESS_TAG="$_tag"
+    VLESS_PUBLIC_KEY="$PUBLIC_KEY"
+    VLESS_SHORT_ID="$_sid"
+    VLESS_OK=true
+    log_info "VLESS + Reality node created: $_tag"
     return 0
 }
 
@@ -851,6 +987,17 @@ show_summary() {
         printf "    Add a client in the panel to get a subscription link.\n"
         if [ -n "$_host" ] && [ "$_host" != "<server-ip>" ]; then
             printf "    ${YELLOW}Open %s/UDP in your firewall/security group.${NC}\n" "$HY2_PORT"
+        fi
+    fi
+    if $VLESS_OK; then
+        printf "\n"
+        printf "  VLESS + Reality node: %s\n" "$VLESS_TAG"
+        printf "    Port: %s/TCP\n" "$VLESS_PORT"
+        printf "    SNI:  %s\n" "$VLESS_SNI"
+        printf "    Fingerprint: chrome (uTLS)\n"
+        printf "    Add a client in the panel to get a subscription link.\n"
+        if [ -n "$_host" ] && [ "$_host" != "<server-ip>" ]; then
+            printf "    ${YELLOW}Open %s/TCP in your firewall/security group.${NC}\n" "$VLESS_PORT"
         fi
     fi
     printf "\n"
@@ -925,6 +1072,7 @@ main() {
     COOKIE_JAR=$(mktemp 2>/dev/null || echo "$INSTALL_DIR/.cookie.$$")
     ADMIN_PASS_SET=true
     HY2_OK=false
+    VLESS_OK=false
     # Seeds the SNI choice. Guarded like random_port's: a failing od under
     # set -e would abort the install at the last step.
     _RAND=$(od -An -N2 -tu2 < /dev/urandom 2>/dev/null | tr -d ' ' || true)
@@ -973,6 +1121,24 @@ main() {
         fi
     else
         log_info "Skipping Hysteria2"
+    fi
+
+    # 4. Offer a VLESS + Reality node. No certificate is involved -- reality
+    #    borrows the handshake of the site it spoofs, and the keypair comes
+    #    from the panel itself. The random seed for the SNI draw is refreshed
+    #    here, so the two nodes do not always land on the same decoy hostname.
+    if ask "Deploy a VLESS + Reality node?"; then
+        _RAND=$(od -An -N2 -tu2 < /dev/urandom 2>/dev/null | tr -d ' ' || true)
+        case "$_RAND" in
+            ''|*[!0-9]*) _RAND=0 ;;
+        esac
+        if ensure_session; then
+            deploy_vless_reality || log_warn "VLESS + Reality deployment failed"
+        else
+            log_error "Could not log in to the panel; skipping VLESS + Reality"
+        fi
+    else
+        log_info "Skipping VLESS + Reality"
     fi
 
     rm -f "$COOKIE_JAR" 2>/dev/null || true

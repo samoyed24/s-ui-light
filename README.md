@@ -17,7 +17,7 @@ wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/s
 
 ## 安装后会做什么
 
-安装完服务后，脚本会依次询问并完成三件事：
+安装完服务后，脚本会依次询问并完成四件事：
 
 1. **重置管理员密码**（无需询问）。用户名保持 `admin`，密码改为随机生成的 24 位强密码，
    并在最后打印出来。s-ui 只存密码哈希，**这串密码只会显示这一次，请立刻保存**。
@@ -32,9 +32,20 @@ wget -O install.sh https://raw.githubusercontent.com/samoyed24/s-ui-light/main/s
    - SNI 从几个热门站点中随机选一个
    - 已开启「允许不安全」（`client.insecure`），客户端无需校验证书
 
-   脚本只创建节点，**不创建客户端**。要拿到订阅链接，需在面板里自行新增客户端并勾选该入站。
+4. **是否部署 VLESS + Reality 节点**（y/N）。选 yes 会创建一个 VLESS 入站：
 
-> 部署完成后请自行放行对应的 UDP 端口。脚本会打印端口号。
+   - Reality 模式，不需要任何证书：服务端借用 SNI 所指站点的握手。密钥对通过
+     面板的 `api/keypairs` 接口生成（X25519）
+   - 端口随机取 20000 以上
+   - SNI 从几个热门站点中随机选一个（与第 3 步独立抽取），handshake 目标同 SNI，443 端口
+   - short_id 随机生成（单个随机字节）
+   - 客户端侧已开启 uTLS，指纹为 `chrome`
+
+   脚本只创建节点，**不创建客户端**。要拿到订阅链接，需在面板里自行新增客户端并勾选该入站。
+   订阅链接里会自动带上 `security=reality&pbk=…&sid=…&fp=chrome`。
+
+> 部署完成后请自行放行对应端口：Hysteria2 走 **UDP**，VLESS + Reality 走 **TCP**。
+> 脚本会在摘要里打印端口号。
 
 ### 证书说明
 
